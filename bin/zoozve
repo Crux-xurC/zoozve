@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""zoozve -- a gate in front of a local server, for Citlalpol's `to`.
+
+    zoozve --port <n> --to <host>:<port> [--key <file>]
+    zoozve serve [--gates <file>] [--key <file>]   every gate of gates.json, in one process
+    zoozve key [--key <file>]            make the key if there is none, and say where it is
+
+gates.json (Citlalpol's config directory by default, beside the key: hidden inside forbidden's wall,
+so a program there cannot add a gate in front of something of yours):
+
+    {"gates": [{"name": "pong", "port": 55480, "to": "127.0.0.1:18080"}]}
+
+Citlalpol sends a connection to a local address (`to` in access.json) only when a gate
+of this machine answers there: at the head of each connection Citlalpol sends a
+challenge, the gate answers it with the machine's key, and from then on the gate only
+relays the bytes to the server behind it (--to: the same version of a database, a stub,
+anything). A port of this machine that is not behind a gate -- a database, a development
+server, an API of some daemon -- does not answer the challenge, so an access.json from
+someone else's repository cannot aim Citlalpol at it.
+
+The challenge, one line each way (zoozve/1):
+
+    Citlalpol -> gate   ZOOZVE/1 <nonce: 32 hex digits>\\r\\n
+    gate -> Citlalpol   ZOOZVE/1 OK <HMAC-SHA256(key, "zoozve/1 <nonce> <the gate's port>"), hex>\\r\\n
+
+The key never crosses the connection, and the answer is good for that nonce and that
+port only (a server that passes the challenge on to a real gate gets the gate's port
+wrong). A first line that is not a challenge closes the connection. The key is
+Citlalpol's (~/.config/citlalpol/zoozve.key, made by `citl setup`; the wall hides it);
+any program that speaks this line can be a gate, in any language.
+"""
+import argparse
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import socket
+import sys
+import threading
+import time
+
+LINE_MAX = 128
+HEAD_TIMEOUT = 5
+CHALLENGE = re.compile(rb"^ZOOZVE/1 ([0-9a-f]{32})\r?\n$")
+
+
+def config_dir():
+    return os.environ.get("CITLALPOL_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "citlalpol")
+
+
+def default_key():
+    return os.path.join(config_dir(), "zoozve.key")
+
+
+def default_gates():
+    return os.path.join(config_dir(), "gates.json")
+
+
+def read_key(path):
+    try:
+        st = os.stat(path)
+        if st.st_mode & 0o077:
+            sys.exit("zoozve: %s can be read by others (chmod 600 it)" % path)
+        with open(path) as f:
+            k = f.read().strip()
+    except FileNotFoundError:
+        sys.exit("zoozve: no key at %s (citl setup, or zoozve key)" % path)
+    if not re.fullmatch(r"[0-9a-f]{64}", k):
+        sys.exit("zoozve: %s is not a key (64 hex digits)" % path)
+    return bytes.fromhex(k)
+
+
+def make_key(path):
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(32) + "\n")
+    print(path)
+
+
+def answer(key, nonce, port):
+    return hmac.new(key, b"zoozve/1 %s %d" % (nonce, port), hashlib.sha256).hexdigest().encode()
+
+
+def say(msg):
+    sys.stderr.write("%s zoozve: %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+def pump(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def serve(c, key, port, to):
+    up = None
+    try:
+        c.settimeout(HEAD_TIMEOUT)
+        line = b""
+        while not line.endswith(b"\n"):
+            d = c.recv(1)
+            if not d or len(line) >= LINE_MAX:
+                say("closed: no challenge")
+                return
+            line += d
+        m = CHALLENGE.match(line)
+        if not m:
+            say("closed: not a challenge")
+            return
+        c.sendall(b"ZOOZVE/1 OK " + answer(key, m.group(1), port) + b"\r\n")
+        c.settimeout(None)
+        try:
+            up = socket.create_connection(to, timeout=5)
+            up.settimeout(None)
+        except OSError as e:
+            say("the server behind, %s:%d, does not answer (%s)" % (to[0], to[1], e))
+            return
+        say("relaying to %s:%d" % to)
+        t = threading.Thread(target=pump, args=(up, c), daemon=True)
+        t.start()
+        pump(c, up)
+        t.join()
+    except OSError:
+        pass
+    finally:
+        c.close()
+        if up:
+            up.close()
+
+
+def parse_to(to):
+    host, _, p = to.rpartition(":")
+    if not host or not p.isdigit():
+        sys.exit("zoozve: --to <host>:<port> (not %r)" % to)
+    return host.strip("[]"), int(p)
+
+
+def gate(port, to, key):
+    """listen on 127.0.0.1:<port> in a thread; -> the listening socket"""
+    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        ls.bind(("127.0.0.1", port))
+    except OSError as e:
+        sys.exit("zoozve: cannot listen on 127.0.0.1:%d (%s)" % (port, e))
+    ls.listen(64)
+    say("gate 127.0.0.1:%d -> %s:%d" % (port, to[0], to[1]))
+
+    def loop():
+        while True:
+            c, _ = ls.accept()
+            threading.Thread(target=serve, args=(c, key, port, to), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+    return ls
+
+
+def serve_all(args):
+    import json
+    ap = argparse.ArgumentParser(prog="zoozve serve")
+    ap.add_argument("--gates", default=default_gates())
+    ap.add_argument("--key", default=default_key())
+    a = ap.parse_args(args)
+    try:
+        with open(a.gates) as f:
+            gates = json.load(f).get("gates", [])
+    except FileNotFoundError:
+        sys.exit("zoozve: no %s ({\"gates\": [{\"name\", \"port\", \"to\"}]})" % a.gates)
+    except ValueError as e:
+        sys.exit("zoozve: %s is not JSON (%s)" % (a.gates, e))
+    if not gates:
+        sys.exit("zoozve: no gate in %s" % a.gates)
+    key = read_key(a.key)
+    for g in gates:
+        if not isinstance(g, dict) or not isinstance(g.get("port"), int) or not isinstance(g.get("to"), str):
+            sys.exit("zoozve: a gate is {\"name\", \"port\": <n>, \"to\": \"<host>:<port>\"} (not %r)" % (g,))
+        gate(g["port"], parse_to(g["to"]), key)
+    signal_wait()
+
+
+def signal_wait():
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    if sys.argv[1:2] == ["serve"]:
+        serve_all(sys.argv[2:])
+        return
+    if sys.argv[1:2] == ["key"]:
+        ap = argparse.ArgumentParser(prog="zoozve key")
+        ap.add_argument("--key", default=default_key())
+        make_key(ap.parse_args(sys.argv[2:]).key)
+        return
+    ap = argparse.ArgumentParser(prog="zoozve", description="a gate in front of a local server, for Citlalpol's to")
+    ap.add_argument("--port", type=int, required=True, help="where the gate listens (127.0.0.1)")
+    ap.add_argument("--to", required=True, help="the local server behind it, <host>:<port>")
+    ap.add_argument("--key", default=default_key())
+    a = ap.parse_args()
+    to = parse_to(a.to)
+    gate(a.port, to, read_key(a.key))
+    signal_wait()
+
+
+if __name__ == "__main__":
+    main()
