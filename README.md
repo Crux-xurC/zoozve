@@ -51,3 +51,5 @@ closes the connection. Any program that speaks this line can be a gate, in any l
 library.
 
 Needs: python3. `test/run.sh` checks it without reaching the network. MIT license.
+
+**Version 0.1.0** (2026-11-25), a development release.
