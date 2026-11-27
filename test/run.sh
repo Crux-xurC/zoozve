@@ -37,25 +37,27 @@ gate="$(port)"
 pids="$pids $!"
 sleep 0.5
 
-client() {  # client <port> <nonce> <port the HMAC is made for> -> what came back, one line each
+client() {  # client <port> <nonce> <address:port the HMAC is made for> -> what came back, one line each
   python3 - "$key" "$1" "$2" "$3" <<'PY'
 import hashlib, hmac, socket, sys
-key = bytes.fromhex(open(sys.argv[1]).read().strip()); port, nonce, for_port = int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+key = bytes.fromhex(open(sys.argv[1]).read().strip()); port, nonce, at = int(sys.argv[2]), sys.argv[3], sys.argv[4]
 c = socket.create_connection(("127.0.0.1", port), timeout=3)
-c.sendall(("ZOOZVE/1 %s\r\n" % nonce).encode())
+c.sendall(("ZOOZVE/2 %s\r\n" % nonce).encode())
 f = c.makefile("rb")
 line = f.readline().decode().strip()
-want = hmac.new(key, ("zoozve/1 %s %d" % (nonce, for_port)).encode(), hashlib.sha256).hexdigest()
-print("answer-ok" if line == "ZOOZVE/1 OK " + want else "answer-bad " + line)
-if line.startswith("ZOOZVE/1 OK"):
+want = hmac.new(key, ("zoozve/2 %s %s" % (nonce, at)).encode(), hashlib.sha256).hexdigest()
+print("answer-ok" if line == "ZOOZVE/2 OK " + want else "answer-bad " + line)
+if line.startswith("ZOOZVE/2 OK"):
     print(f.readline().decode().strip()); c.sendall(b"ping"); print(f.read().decode().strip())
 PY
 }
-out="$(client "$gate" 0123456789abcdef0123456789abcdef "$gate" 2>&1)"
-check "the answer is HMAC(key, zoozve/1 <nonce> <port>)" '[[ "$out" == answer-ok* ]]'
+out="$(client "$gate" 0123456789abcdef0123456789abcdef "127.0.0.1:$gate" 2>&1)"
+check "the answer is HMAC(key, zoozve/2 <nonce> <address>:<port>)" '[[ "$out" == answer-ok* ]]'
 check "then it relays: the server's first words, and its answer" '[[ "$out" == *HELLO*"got ping"* ]]'
-out="$(client "$gate" 0123456789abcdef0123456789abcdef 9 2>&1)"
-check "the answer is good for the gate's own port only (passed on from elsewhere, it is wrong)" '[[ "$out" == answer-bad* ]]'
+out="$(client "$gate" 0123456789abcdef0123456789abcdef "127.0.0.1:9" 2>&1)"
+check "the answer is good for the gate's own port only (passed on from another port, it is wrong)" '[[ "$out" == answer-bad* ]]'
+out="$(client "$gate" 0123456789abcdef0123456789abcdef "127.0.0.2:$gate" 2>&1)"
+check "...and its own address only (passed on from 127.0.0.2 or ::1 at the same port, it is wrong)" '[[ "$out" == answer-bad* ]]'
 out="$(printf 'GET / HTTP/1.0\r\n\r\n' | python3 -c '
 import socket, sys
 c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); c.sendall(sys.stdin.buffer.read())
@@ -64,7 +66,7 @@ except ConnectionResetError: print(repr(b""))' "$gate")"
 check "a first line that is not a challenge: closed, nothing relayed" '[ "$out" = "b'"''"'" ]'
 out="$(python3 -c '
 import socket, sys
-c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); c.sendall(b"ZOOZVE/1 xyz\r\n"); print(repr(c.recv(100)))' "$gate")"
+c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); c.sendall(b"ZOOZVE/2 xyz\r\n"); print(repr(c.recv(100)))' "$gate")"
 check "a malformed nonce: closed" '[ "$out" = "b'"''"'" ]'
 pongp="$(port)"
 python3 "$here/examples/pong.py" --port "$pongp" >/dev/null 2>&1 &
@@ -75,7 +77,7 @@ printf '{"gates": [{"name": "pong", "port": %d, "to": "127.0.0.1:%d"}, {"name": 
 "$Z" serve 2>"$work/serve.log" &
 pids="$pids $!"
 sleep 0.7
-out="$(client "$g2" 0123456789abcdef0123456789abcdef "$g2" 2>&1)"
+out="$(client "$g2" 0123456789abcdef0123456789abcdef "127.0.0.1:$g2" 2>&1)"
 check "zoozve serve: every gate of gates.json (beside the key) answers and relays" '[[ "$out" == answer-ok*HELLO*"got ping"* ]] && grep -q "gate 127.0.0.1:$g1" "$work/serve.log"'
 check "examples/pong.py answers /ping" '[ "$(curl -sS -m3 "http://127.0.0.1:$pongp/ping")" = pong ]'
 echo '{"gates": []}' > "$work/empty.json"

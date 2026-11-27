@@ -18,14 +18,16 @@ anything). A port of this machine that is not behind a gate -- a database, a dev
 server, an API of some daemon -- does not answer the challenge, so an access.json from
 someone else's repository cannot aim Citlalpol at it.
 
-The challenge, one line each way (zoozve/1):
+The challenge, one line each way (zoozve/2):
 
-    Citlalpol -> gate   ZOOZVE/1 <nonce: 32 hex digits>\\r\\n
-    gate -> Citlalpol   ZOOZVE/1 OK <HMAC-SHA256(key, "zoozve/1 <nonce> <the gate's port>"), hex>\\r\\n
+    Citlalpol -> gate   ZOOZVE/2 <nonce: 32 hex digits>\\r\\n
+    gate -> Citlalpol   ZOOZVE/2 OK <HMAC-SHA256(key, "zoozve/2 <nonce> <address>:<port>"), hex>\\r\\n
 
-The key never crosses the connection, and the answer is good for that nonce and that
-port only (a server that passes the challenge on to a real gate gets the gate's port
-wrong). A first line that is not a challenge closes the connection. The key is
+<address>:<port> is where the connection came in: the gate's own end (127.0.0.1:<port>), and
+the address Citlalpol connected to. The key never crosses the connection, and the answer is
+good for that nonce at that address and port only: a server elsewhere that passes the
+challenge on to a real gate (another port, or 127.0.0.2 / ::1 at the same port) gets it
+wrong. A first line that is not a challenge closes the connection. The key is
 Citlalpol's (~/.config/citlalpol/zoozve.key, made by `citl setup`; the wall hides it);
 any program that speaks this line can be a gate, in any language.
 """
@@ -42,7 +44,7 @@ import time
 
 LINE_MAX = 128
 HEAD_TIMEOUT = 5
-CHALLENGE = re.compile(rb"^ZOOZVE/1 ([0-9a-f]{32})\r?\n$")
+CHALLENGE = re.compile(rb"^ZOOZVE/2 ([0-9a-f]{32})\r?\n$")
 
 
 def config_dir():
@@ -81,8 +83,14 @@ def make_key(path):
     print(path)
 
 
-def answer(key, nonce, port):
-    return hmac.new(key, b"zoozve/1 %s %d" % (nonce, port), hashlib.sha256).hexdigest().encode()
+def where(sockname):
+    """the gate's own end of a connection, as Citlalpol writes the address it connected to"""
+    host, port = sockname[0], sockname[1]
+    return ("[%s]:%d" % (host, port) if ":" in host else "%s:%d" % (host, port)).encode()
+
+
+def answer(key, nonce, at):
+    return hmac.new(key, b"zoozve/2 %s %s" % (nonce, at), hashlib.sha256).hexdigest().encode()
 
 
 def say(msg):
@@ -121,7 +129,7 @@ def serve(c, key, port, to):
         if not m:
             say("closed: not a challenge")
             return
-        c.sendall(b"ZOOZVE/1 OK " + answer(key, m.group(1), port) + b"\r\n")
+        c.sendall(b"ZOOZVE/2 OK " + answer(key, m.group(1), where(c.getsockname())) + b"\r\n")
         c.settimeout(None)
         try:
             up = socket.create_connection(to, timeout=5)
